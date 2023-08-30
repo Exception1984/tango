@@ -133,10 +133,10 @@ def lambda_trick(lobe1, lambda1, mu1, lobe2, lambda2, mu2):
 #######################################################################################################
 # below is the SG renderer
 #######################################################################################################
-def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, normal, viewdirs, diffuse_rgb=None, has_diffuse = True, has_specular = True):
+def render_with_sg(lgtSGs, metallic, roughness, diffuse_albedo, normal, viewdirs, diffuse_rgb=None, has_diffuse = True, has_specular = True):
     '''
     :param lgtSGs: [M, 7]
-    :param specular_reflectance: [K, 3];
+    :param metallic: [K, 1];
     :param roughness: [K, 1]; values must be positive
     :param diffuse_albedo: [..., 3]; values must lie in [0,1]
     :param normal: [..., 3]; ----> camera; must have unit norm
@@ -147,8 +147,10 @@ def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, norm
     # specular_reflectance = 1 + 0 * specular_reflectance
     # roughness = 0.125 + 0 * roughness
     
-    specular_albedo = specular_reflectance
+    device = metallic.device
     
+    metallic_output = metallic
+    normals_output = 0.5 * (1 + normal) # [-1, 1] -> [0, 1]
     
     M = lgtSGs.shape[0] #128        # 64
     # K = specular_reflectance.shape[0]  # 1 
@@ -205,19 +207,31 @@ def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, norm
         v_dot_lobe = torch.clamp(v_dot_lobe, min=0.)
         warpBrdfSGLobes = 2 * v_dot_lobe * brdfSGLobes - viewdirs
         warpBrdfSGLobes = warpBrdfSGLobes / (torch.norm(warpBrdfSGLobes, dim=-1, keepdim=True) + TINY_NUMBER)
-        # warpBrdfSGLambdas = brdfSGLambdas / (4 * torch.abs(torch.sum(brdfSGLobes * viewdirs, dim=-1, keepdim=True)) + TINY_NUMBER)
-        warpBrdfSGLambdas = brdfSGLambdas / (4 * v_dot_lobe + TINY_NUMBER)  # can be huge
-        warpBrdfSGMus = brdfSGMus  # [..., M, K, 3]
-
-        # add fresnel and geometric terms; apply the smoothness assumption in SG paper
-        new_half = warpBrdfSGLobes + viewdirs
+        
+        new_half = warpBrdfSGLobes + viewdirs # This is exactly the normal aka. brdfSGLobes!!!
         new_half = new_half / (torch.norm(new_half, dim=-1, keepdim=True) + TINY_NUMBER)
         v_dot_h = torch.sum(viewdirs * new_half, dim=-1, keepdim=True)
         ### note: for numeric stability
         v_dot_h = torch.clamp(v_dot_h, min=0.)
+        
+        ORIG = True
+        
+        # warpBrdfSGLambdas = brdfSGLambdas / (4 * torch.abs(torch.sum(brdfSGLobes * viewdirs, dim=-1, keepdim=True)) + TINY_NUMBER)
+        
+        if ORIG == True:
+            warpBrdfSGLambdas = brdfSGLambdas / (4 * v_dot_lobe + TINY_NUMBER)  # can be huge # WHY DID THEY USE THIS?
+        else:
+            warpBrdfSGLambdas = brdfSGLambdas / (4 * v_dot_h + TINY_NUMBER)            
+        
+        warpBrdfSGMus = brdfSGMus  # [..., M, K, 3]
+
+        # add fresnel and geometric terms; apply the smoothness assumption in SG paper
+        
         # specular_reflectance = prepend_dims(specular_reflectance, dots_shape + [M, ])  # [..., M, K, 3]
-        specular_reflectance = specular_reflectance.unsqueeze(-2).unsqueeze(-2).expand(dots_shape + [M, K, 3])
-        F = specular_reflectance + (1. - specular_reflectance) * torch.pow(2.0, -(5.55473 * v_dot_h + 6.8316) * v_dot_h) # Fresnel Term - Schlick?
+        
+        f0 = torch.lerp(torch.tensor(0.04, device = device).reshape([1, 1]), diffuse_albedo, metallic)
+        f0 = f0.unsqueeze(-2).unsqueeze(-2).expand(dots_shape + [M, K, 3])
+        F = f0 + (1. - f0) * torch.pow(2.0, -(5.55473 * v_dot_h + 6.8316) * v_dot_h) # Fresnel Term - Schlick?
 
         dot1 = torch.sum(warpBrdfSGLobes * normal, dim=-1, keepdim=True)  # equals <o, n> -> L.N
         ### note: for numeric stability
@@ -264,7 +278,9 @@ def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, norm
     ########################################
     diffuse_rgb = None
     if has_diffuse and diffuse_rgb is None:
-        diffuse = (diffuse_albedo / np.pi).unsqueeze(-2).unsqueeze(-2).expand(dots_shape + [M, 1, 3])
+        black = torch.tensor(0.0, device = device).reshape([1, 1])
+        c_diff = torch.lerp(diffuse_albedo, black, metallic)
+        diffuse = (c_diff / np.pi).unsqueeze(-2).unsqueeze(-2).expand(dots_shape + [M, 1, 3])
 
         # multiply with light sg
         final_lobes = lgtSGLobes.narrow(dim=-2, start=0, length=1)  # [..., M, K, 3] --> [..., M, 1, 3]
@@ -279,6 +295,10 @@ def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, norm
         dot2 = torch.sum(final_lobes * normal, dim=-1, keepdim=True)
         diffuse_rgb = mu_prime * hemisphere_int(lambda_prime, dot1) - \
                       final_mus * alpha_cos * hemisphere_int(final_lambdas, dot2)
+                      
+        if has_specular:
+            diffuse_rgb = (1 - F) * diffuse_rgb  # ([378330, 64, 1, 3]) * 
+            
         diffuse_rgb = diffuse_rgb.sum(dim=-2).sum(dim=-2)
         diffuse_rgb = torch.clamp(diffuse_rgb, min=0.)
         
@@ -288,11 +308,12 @@ def render_with_sg(lgtSGs, specular_reflectance, roughness, diffuse_albedo, norm
     # combine diffue and specular rgb, then return
     rgb = torch.clamp(specular_rgb + diffuse_rgb, min = 0.0, max = 1.0)
    
-    ret = {'sg_rgb': rgb,
-           'sg_specular_rgb': specular_rgb,
-           'sg_specular_albedo': specular_albedo,
+    ret = {'sg_diffuse_albedo': diffuse_albedo,
            'sg_diffuse_rgb': diffuse_rgb,
-           'sg_diffuse_albedo': diffuse_albedo,
-           'sg_roughness': roughness}
+           'sg_metallic': metallic_output,
+           'sg_normals': normals_output,
+           'sg_rgb': rgb,
+           'sg_roughness': roughness,
+           'sg_specular_rgb': specular_rgb}
 
     return ret

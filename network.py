@@ -35,9 +35,9 @@ def fibonacci_sphere(samples = 1):
     
     return points
 
-def compute_energy(lgtSGs):
-    lgtLambda = torch.abs(lgtSGs[:, 3:4])       # [M, 1]
-    lgtMu = torch.abs(lgtSGs[:, 4:])               # [M, 3]
+def compute_energy(lgtSGs): # [M, 7]; lobe + lambda + mu -> mu [0, 1, 2] (lobe axis), lambda [3] (lobe sharpness), a [4:7] (lobe amplitude)
+    lgtLambda = torch.abs(lgtSGs[:, 3:4])          # [M, 1] # lobe sharpness
+    lgtMu = torch.abs(lgtSGs[:, 4:])               # [M, 3] # lobe amplitude
     energy = lgtMu * 2.0 * np.pi / lgtLambda * (1.0 - torch.exp(-2.0 * lgtLambda))
     return energy
 
